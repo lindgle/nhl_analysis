@@ -14,25 +14,22 @@ pd.set_option('display.width', 700)
 api = NHLapi()
 
 #%%
-df1718 = api.get_games(start='2017-10-01', end='2018-05-01')
-df1718 = df1718.query('game_type == "R"')
-df1819 = api.get_games(start='2018-10-01', end='2019-05-01')
-df1819 = df1819.query('game_type == "R"')
+# Load games, use only games that have been played
+df = api.get_games(start='2019-10-01', end='2020-05-01')
+df = df.query('status == "Final"')
 
+# Load list of teams
 teams = api.get_teams()
 
-standings = api.get_standings(season=20172018)
-standings['score'] = prev_season_ability(standings.points)
-#%%
-
-df = game_number(df1819)
+# Process game data
+df = game_number(df)
 df = convert_team_ids(df, teams)
 df['goal_diff'] = df['home_team_score'] - df['away_team_score']
 
+# Set standings from pprevious season
+standings = api.get_standings(season=20182019)
+standings['score'] = prev_season_ability(standings.points)
 
-df.head()
-
-#%%
 standings = standings.merge(teams, on='team_id_original').sort_values('team_id')
 
 #%%
@@ -73,12 +70,12 @@ model_code = '''
         vector[ngames] a_diff;
         // Priors
         nu ~ gamma(2, 0.1);
-        b_prev ~ normal(0, 1);
+        b_prev ~ normal(0, 0.2);
         sigma_a0 ~ normal(0, 1);
         sigma_y ~ normal(0, 5);
         b_home ~ normal(0, 1);
-        sigma_a_raw ~ normal(0, 1);
-        tau_a ~ cauchy(0, 1);
+        sigma_a_raw ~ normal(0, 5);
+        tau_a ~ cauchy(0, 2);
         to_vector(eta_a) ~ normal(0, 1);
         // Likelihood
         for (g in 1:ngames) {
@@ -91,10 +88,10 @@ model_code = '''
 sm = StanModel(model_code=model_code)
 
 #%%
-sub_df = df.query('home_game_number == 1 | away_game_number == 1')
+sub_df = df.copy()
 ngames = sub_df.shape[0]
 nteams = standings.shape[0]
-n_match_days = 2
+n_match_days = max(df.home_game_number.max(), df.away_game_number.max())
 
 data = {'nteams': nteams,
          'ngames': ngames,
@@ -106,6 +103,38 @@ data = {'nteams': nteams,
          'goal_diff': sub_df['goal_diff'].values,
          'prev_perf': standings['score']}
 
-fit = sm.sampling(data=data, iter=1000, chains=4)
+fit = sm.sampling(data=data, 
+                  iter=1000, 
+                  warmup=500, 
+                  chains=4)
+
+#%%
+# Goal: construct df:
+# team / game_nro / drawn value of a
+
+data = fit.extract('a')['a']
+
+df_list = []
+for _, row in teams.iterrows():
+    team_id = row['team_id']
+    tmp = data[:, :, team_id-1]    
+    for game_no in range(tmp.shape[1]):
+        sample = tmp[:, game_no]
+        df_list.append(pd.DataFrame({'game_no': game_no, 
+                                     'ability': sample, 
+                                     'team_id': team_id}))
+data = pd.concat(df_list).reset_index(drop=True)
+data = data.merge(teams[['team_id', 'team_name']], on='team_id')
+
+#%%
+#import seaborn as sns
+team_list = ['Dallas Stars','Detroit Red Wings', 'Los Angeles Kings', 'Calgary Flames', 'San Jose Sharks']
+mask = data['team_name'].isin(team_list)
+
+ax = sns.lineplot(x='game_no', 
+                  y='ability', 
+                  data=data[mask], 
+                  hue='team_name',
+                  markers=True)
 
 
